@@ -2,7 +2,6 @@ import hashlib
 import hmac
 import html
 import os
-import random
 import re
 import sqlite3
 from contextlib import closing
@@ -11,11 +10,24 @@ from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 
+from books_data import BOOKS
 
 DB_FILE = "library_v2.db"
+CATALOG_VERSION = "2"
 MAX_LOANS = 5
 LOAN_DAYS = 14
 PAGE_SIZE = 12
+POPULAR_COUNT = 40
+NEW_YEARS = 2
+NEW_DAYS = 30
+
+AGE_LABELS = {
+    "All ages": None,
+    "Kids (0–12)": "Kids",
+    "Teens (13–17)": "Teens",
+    "Adults (18+)": "Adults",
+}
+VIEWS = ["All", "🆕 New", "🔥 Popular", "🔜 Upcoming"]
 
 st.set_page_config(page_title="Athenaeum Library", page_icon="📚", layout="wide")
 
@@ -31,17 +43,25 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 [data-testid="stMetric"] { background: rgba(128,128,128,.08); border: 1px solid rgba(128,128,128,.2); padding: 16px 18px; border-radius: 16px; }
 .book-card { border: 1px solid rgba(128,128,128,.22); border-radius: 16px; overflow: hidden; background: rgba(128,128,128,.06); margin-bottom: 8px; transition: transform .15s, box-shadow .15s; }
 .book-card:hover { transform: translateY(-3px); box-shadow: 0 8px 22px rgba(0,0,0,.18); }
-.cover { height: 110px; display: flex; align-items: center; justify-content: space-between; padding: 0 18px; color: #fff; }
+.cover { height: 116px; display: flex; align-items: center; justify-content: space-between; padding: 0 18px; color: #fff; }
 .cover .initial { font-size: 3rem; font-weight: 700; opacity: .95; }
+.cover-right { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
 .cover .num { font-size: .85rem; font-weight: 600; background: rgba(0,0,0,.28); padding: 4px 12px; border-radius: 999px; }
-.book-body { padding: 14px 16px 16px; }
+.flag { font-size: .68rem; font-weight: 700; padding: 2px 9px; border-radius: 999px; background: #fff; letter-spacing: .02em; }
+.flag-hot { color: #ea580c; }
+.flag-new { color: #db2777; }
+.flag-soon { color: #0284c7; }
+.book-body { padding: 14px 16px 16px; min-height: 140px; }
 .book-title { font-weight: 600; font-size: 1.02rem; line-height: 1.3; min-height: 2.6em; }
 .book-author { opacity: .7; font-size: .88rem; margin: 2px 0 10px; }
-.badge { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: .75rem; font-weight: 600; margin-right: 6px; }
+.badges { display: flex; flex-wrap: wrap; gap: 6px; }
+.badge { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: .75rem; font-weight: 600; }
 .badge-ok { background: rgba(16,185,129,.18); color: #10b981; }
 .badge-no { background: rgba(239,68,68,.18); color: #ef4444; }
 .badge-warn { background: rgba(245,158,11,.2); color: #f59e0b; }
 .badge-genre { background: rgba(99,102,241,.18); color: #818cf8; }
+.badge-age { background: rgba(236,72,153,.18); color: #f472b6; }
+.badge-soon { background: rgba(14,165,233,.18); color: #38bdf8; }
 .loan-card { display: flex; gap: 16px; align-items: center; padding: 14px 16px; border: 1px solid rgba(128,128,128,.22); border-radius: 16px; background: rgba(128,128,128,.06); }
 .mini-cover { min-width: 56px; height: 56px; border-radius: 12px; display: flex; align-items: center; justify-content: center; color: #fff; font-weight: 700; }
 .user-chip { display: flex; gap: 12px; align-items: center; padding: 12px; border-radius: 14px; background: rgba(128,128,128,.1); margin-bottom: 14px; }
@@ -59,7 +79,11 @@ CREATE TABLE IF NOT EXISTS books (
     year INTEGER,
     isbn TEXT,
     copies INTEGER NOT NULL DEFAULT 1,
-    available INTEGER NOT NULL DEFAULT 1
+    available INTEGER NOT NULL DEFAULT 1,
+    age_group TEXT,
+    release_date TEXT,
+    added_on TEXT,
+    popularity INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,17 +103,39 @@ CREATE TABLE IF NOT EXISTS loans (
     due_on TEXT NOT NULL,
     returned_on TEXT
 );
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+"""
+
+NEW_COLUMNS = {
+    "age_group": "TEXT",
+    "release_date": "TEXT",
+    "added_on": "TEXT",
+    "popularity": "INTEGER NOT NULL DEFAULT 0",
+}
+
+BOOKS_SQL = """
+SELECT b.*, b.popularity + 10 * COALESCE(c.n, 0) AS pop_score
+FROM books b
+LEFT JOIN (SELECT book_id, COUNT(*) AS n FROM loans GROUP BY book_id) c ON c.book_id = b.id
 """
 
 HELP = """Hi! I'm the library bot. Try things like:
 
 - **A book number** — `42` or `book #42`
-- **A title, author or genre** — `dune`, `tolkien`, `sci-fi available`
+- **A title, author or genre** — `dune`, `tolkien`, `manga`, `sci-fi available`
 - **Borrow or return** — `borrow 42`, `return 42`, `borrow dune`
+- **Collections** — `new arrivals`, `popular manga`, `coming soon`
+- **By age** — `books for kids`, `manga for teens`, `adult books`
 - **Other** — `my loans`, `genres`, `surprise me`
 """
 
-TEMPLATE = "title,author,genre,year,copies\nExample Book,Jane Doe,Fiction,2020,2\n"
+TEMPLATE = (
+    "title,author,genre,year,copies,age,release_date\n"
+    "Example Book,Jane Doe,Fiction,2020,2,Adults,\n"
+)
 
 STOP = {
     "a", "an", "the", "do", "you", "have", "has", "is", "are", "there", "any", "book",
@@ -98,6 +144,18 @@ STOP = {
     "who", "wrote", "written", "author", "title", "number", "no", "copy", "available",
     "genre", "novel", "some", "like", "something", "it", "my", "and",
 }
+
+AGE_PATTERNS = [
+    ("Kids", r"\bfor (?:kids?|children|little ones)\b|\b(?:kids?|children'?s)\s+(?:books?|manga|section)\b"),
+    ("Teens", r"\byoung adults?\b|\bfor teen(?:s|agers?)?\b|\bteen(?:s|age)?\s+(?:books?|manga|section)\b"),
+    ("Adults", r"\bfor adults?\b|\badults?\s+(?:books?|manga|section)\b"),
+]
+
+KIND_PATTERNS = [
+    ("upcoming", r"\b(upcoming|coming soon|not out yet|pre-?orders?|releasing)\b"),
+    ("new", r"\b(new arrivals?|newest|latest|what'?s new|recently added|new (?:books?|releases?|titles?|manga))\b"),
+    ("popular", r"\b(popular|trending|best[- ]?sellers?|most borrowed|top picks?|top books?)\b"),
+]
 
 
 def run(query, params=()):
@@ -159,19 +217,39 @@ def authenticate(username, password):
     return None
 
 
+def sync_catalog(conn):
+    existing = {r[0] for r in conn.execute("SELECT title FROM books")}
+    for b in BOOKS:
+        if b["title"] in existing:
+            conn.execute(
+                "UPDATE books SET age_group = COALESCE(age_group, ?), "
+                "popularity = CASE WHEN popularity = 0 THEN ? ELSE popularity END, "
+                "release_date = COALESCE(release_date, ?) WHERE title = ?",
+                (b["age"], b["popularity"], b["release"], b["title"]),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO books (title, author, genre, year, isbn, copies, available, "
+                "age_group, release_date, popularity) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (b["title"], b["author"], b["genre"], b["year"], "", b["copies"], b["copies"],
+                 b["age"], b["release"], b["popularity"]),
+            )
+
+
 @st.cache_resource
 def init_db():
     with closing(sqlite3.connect(DB_FILE)) as conn:
         conn.executescript(SCHEMA)
-        if conn.execute("SELECT COUNT(*) FROM books").fetchone()[0] == 0:
-            rows = []
-            for i, (title, author, genre, year) in enumerate(BOOKS):
-                copies = 1 + (i * 7) % 4
-                rows.append((title, author, genre, year, "", copies, copies))
-            conn.executemany(
-                "INSERT INTO books (title, author, genre, year, isbn, copies, available) "
-                "VALUES (?,?,?,?,?,?,?)",
-                rows,
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(books)")}
+        for name, ddl in NEW_COLUMNS.items():
+            if name not in cols:
+                conn.execute(f"ALTER TABLE books ADD COLUMN {name} {ddl}")
+        row = conn.execute("SELECT value FROM meta WHERE key='catalog_version'").fetchone()
+        if not row or row[0] != CATALOG_VERSION:
+            sync_catalog(conn)
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('catalog_version', ?)",
+                (CATALOG_VERSION,),
             )
         conn.commit()
     if read("SELECT COUNT(*) AS n FROM users")["n"][0] == 0:
@@ -179,11 +257,30 @@ def init_db():
     return True
 
 
+def load_books():
+    df = read(BOOKS_SQL)
+    today = date.today()
+    release = df["release_date"].fillna("")
+    added = df["added_on"].fillna("")
+    df["age_group"] = df["age_group"].fillna("Adults")
+    df["upcoming"] = (release != "") & (release > str(today))
+    recent_year = df["year"].fillna(0) >= today.year - NEW_YEARS
+    recent_add = (added != "") & (added >= str(today - timedelta(days=NEW_DAYS)))
+    df["is_new"] = (recent_year | recent_add) & ~df["upcoming"]
+    ranked = df[~df["upcoming"] & (df["pop_score"] > 0)].nlargest(POPULAR_COUNT, "pop_score")
+    df["is_popular"] = df["id"].isin(ranked["id"])
+    return df
+
+
 def borrow_book(book_id, user_id, days=LOAN_DAYS):
     book = read("SELECT * FROM books WHERE id=?", (int(book_id),))
     if book.empty:
         return False, f"There is no book with number {book_id}."
     b = book.iloc[0]
+    today = date.today()
+    if pd.notna(b["release_date"]) and b["release_date"] and str(b["release_date"]) > str(today):
+        out = date.fromisoformat(b["release_date"])
+        return False, f"“{b['title']}” comes out on {out:%d %b %Y} and can't be borrowed yet."
     if b["available"] < 1:
         return False, f"“{b['title']}” has no free copies right now."
     held = read("SELECT book_id FROM loans WHERE user_id=? AND returned_on IS NULL", (user_id,))
@@ -191,7 +288,6 @@ def borrow_book(book_id, user_id, days=LOAN_DAYS):
         return False, f"You already have {MAX_LOANS} books out. Return one first."
     if int(book_id) in held["book_id"].tolist():
         return False, "You already have this book."
-    today = date.today()
     due = today + timedelta(days=days)
     run(
         "INSERT INTO loans (book_id, user_id, borrowed_on, due_on) VALUES (?,?,?,?)",
@@ -233,6 +329,7 @@ def import_csv(file):
     missing = {"title", "author"} - set(df.columns)
     if missing:
         return 0, f"Missing column(s): {', '.join(sorted(missing))}"
+    today = str(date.today())
     rows = []
     for r in df.to_dict("records"):
         title = str(r.get("title", "")).strip()
@@ -243,11 +340,22 @@ def import_csv(file):
         genre = str(genre).strip() if pd.notna(genre) else "Other"
         year = int(r["year"]) if pd.notna(r.get("year")) else None
         copies = max(1, int(r["copies"])) if pd.notna(r.get("copies")) else 1
-        rows.append((title, author, genre, year, "", copies, copies))
+        age = str(r.get("age", "")).strip().title()
+        age = age if age in ("Kids", "Teens", "Adults") else "Adults"
+        release = None
+        raw = r.get("release_date")
+        if pd.notna(raw) and str(raw).strip():
+            try:
+                release = str(pd.to_datetime(raw).date())
+            except (ValueError, TypeError):
+                release = None
+            if release and release <= today:
+                release = None
+        rows.append((title, author, genre, year, "", copies, copies, age, release, today))
     with closing(sqlite3.connect(DB_FILE)) as conn:
         conn.executemany(
-            "INSERT INTO books (title, author, genre, year, isbn, copies, available) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO books (title, author, genre, year, isbn, copies, available, "
+            "age_group, release_date, added_on) VALUES (?,?,?,?,?,?,?,?,?,?)",
             rows,
         )
         conn.commit()
@@ -260,22 +368,33 @@ def cover_color(genre):
 
 
 def book_card_html(b):
-    avail = int(b.available)
-    if avail > 0:
-        badge = f'<span class="badge badge-ok">{avail} of {int(b.copies)} available</span>'
+    if b.upcoming:
+        out = date.fromisoformat(b.release_date)
+        status = f'<span class="badge badge-soon">Out {out:%d %b %Y}</span>'
+    elif b.available > 0:
+        status = f'<span class="badge badge-ok">{int(b.available)} of {int(b.copies)} available</span>'
     else:
-        badge = '<span class="badge badge-no">All borrowed</span>'
+        status = '<span class="badge badge-no">All borrowed</span>'
+    flags = ""
+    if b.is_popular:
+        flags += '<span class="flag flag-hot">🔥 POPULAR</span>'
+    if b.is_new:
+        flags += '<span class="flag flag-new">NEW</span>'
+    if b.upcoming:
+        flags += '<span class="flag flag-soon">SOON</span>'
     year = int(b.year) if pd.notna(b.year) else "n/a"
     return (
         '<div class="book-card">'
         f'<div class="cover" style="background:{cover_color(b.genre)}">'
         f'<span class="initial">{html.escape(b.title[:1].upper())}</span>'
-        f'<span class="num">No. {int(b.id)}</span></div>'
+        f'<div class="cover-right"><span class="num">No. {int(b.id)}</span>{flags}</div></div>'
         '<div class="book-body">'
         f'<div class="book-title">{html.escape(b.title)}</div>'
         f'<div class="book-author">{html.escape(b.author)} · {year}</div>'
-        f'<span class="badge badge-genre">{html.escape(b.genre or "")}</span>{badge}'
-        "</div></div>"
+        '<div class="badges">'
+        f'<span class="badge badge-genre">{html.escape(b.genre or "")}</span>'
+        f'<span class="badge badge-age">{html.escape(b.age_group)}</span>'
+        f"{status}</div></div></div>"
     )
 
 
@@ -315,10 +434,18 @@ def flash():
         st.toast(msg[1], icon="✅" if msg[0] else "⚠️")
 
 
+def show_strip(df):
+    if df.empty:
+        st.info("Nothing here yet.")
+        return
+    for col, b in zip(st.columns(4), df.head(4).itertuples()):
+        col.markdown(book_card_html(b), unsafe_allow_html=True)
+
+
 def find_books(query, limit=6, only_available=False):
-    df = read("SELECT * FROM books")
+    df = load_books()
     if only_available:
-        df = df[df["available"] > 0]
+        df = df[(df["available"] > 0) & ~df["upcoming"]]
     words = [w for w in re.findall(r"[\w'.-]+", query.lower()) if w not in STOP]
     if not words:
         return df.head(limit) if only_available else df.iloc[0:0]
@@ -335,14 +462,64 @@ def find_books(query, limit=6, only_available=False):
 
 def describe(r):
     year = int(r.year) if pd.notna(r.year) else "n/a"
-    status = f"✅ {int(r.available)}/{int(r.copies)} available" if r.available > 0 else "❌ all copies out"
-    return f"**No. {r.id} · {r.title}** — {r.author} ({year}) · {r.genre} · {status}"
+    if r.upcoming:
+        status = f"🔜 out {date.fromisoformat(r.release_date):%d %b %Y}"
+    elif r.available > 0:
+        status = f"✅ {int(r.available)}/{int(r.copies)} available"
+    else:
+        status = "❌ all copies out"
+    tags = ("🆕 " if r.is_new else "") + ("🔥 " if r.is_popular else "")
+    return f"**No. {r.id} · {r.title}** {tags}— {r.author} ({year}) · {r.genre} · {r.age_group} · {status}"
 
 
 def genre_in_text(genre, text):
     if genre.lower() in text:
         return True
     return any(len(w) > 4 and w in text for w in re.split(r"\W+", genre.lower()))
+
+
+def age_from_text(t):
+    for group, pattern in AGE_PATTERNS:
+        if re.search(pattern, t):
+            return group
+    return None
+
+
+def kind_from_text(t):
+    for kind, pattern in KIND_PATTERNS:
+        if re.search(pattern, t):
+            return kind
+    return None
+
+
+def collection_reply(kind, age, t):
+    df = load_books()
+    genres = [
+        g for g in df["genre"].dropna().unique()
+        if genre_in_text(g, t) and not (age and g == "Children & Young Adult")
+    ]
+    if kind == "upcoming":
+        df = df[df["upcoming"]].sort_values("release_date")
+        title = "Coming soon"
+    elif kind == "new":
+        df = df[df["is_new"]].sort_values(["year", "id"], ascending=False)
+        title = "New arrivals"
+    elif kind == "popular":
+        df = df[df["is_popular"]].sort_values("pop_score", ascending=False)
+        title = "Most popular"
+    else:
+        df = df[~df["upcoming"]].sort_values("pop_score", ascending=False)
+        title = "Top picks"
+    if age:
+        df = df[df["age_group"] == age]
+        title += f" for {age.lower()}"
+    if genres:
+        df = df[df["genre"].isin(genres)]
+        title += f" · {', '.join(genres)}"
+    if df.empty:
+        return f"There's nothing in **{title}** yet."
+    lines = "\n".join(f"- {describe(r)}" for r in df.head(8).itertuples())
+    return f"**{title}**\n{lines}"
 
 
 def handle_action(verb, rest, user):
@@ -390,10 +567,14 @@ def bot_reply(text, user):
     if re.search(r"\b(genres?|categories|sections)\b", t):
         df = read("SELECT genre, COUNT(*) AS n FROM books GROUP BY genre ORDER BY n DESC")
         lines = "\n".join(f"- {r.genre} ({r.n} titles)" for r in df.itertuples())
-        return f"We have these genres:\n{lines}"
+        return f"We have these genres:\n{lines}\n\nAge groups: Kids (0–12), Teens (13–17), Adults (18+)."
 
     if re.search(r"\b(surprise|random|recommend|suggest)\b", t):
-        df = read("SELECT * FROM books WHERE available > 0")
+        df = load_books()
+        df = df[(df["available"] > 0) & ~df["upcoming"]]
+        age = age_from_text(t)
+        if age:
+            df = df[df["age_group"] == age]
         genres = [g for g in df["genre"].dropna().unique() if genre_in_text(g, t)]
         if genres:
             df = df[df["genre"].isin(genres)]
@@ -402,21 +583,28 @@ def bot_reply(text, user):
         r = next(df.sample(1).itertuples())
         return f"How about this one?\n\n{describe(r)}\n\nSay `borrow {r.id}` to take it home."
 
+    kind = kind_from_text(t)
+    age = age_from_text(t)
+    if kind or age:
+        return collection_reply(kind, age, t)
+
     m = re.search(r"(?:#|\bno\.?\s*|\bnumber\s*|\bbook\s*)(\d+)", t) or re.fullmatch(r"\s*(\d+)\s*", t)
     if m:
         digits = m.group(1)
+        df = load_books()
         if len(digits) >= 10:
-            df = read("SELECT * FROM books WHERE isbn=?", (digits,))
+            df = df[df["isbn"] == digits]
             if df.empty:
                 return f"No book with ISBN {digits} in our catalog."
-            r = next(df.itertuples())
-            return describe(r)
+            return describe(next(df.itertuples()))
         n = int(digits)
-        df = read("SELECT * FROM books WHERE id=?", (n,))
-        if df.empty:
-            top = int(read("SELECT MAX(id) AS m FROM books")["m"][0])
+        found = df[df["id"] == n]
+        if found.empty:
+            top = int(df["id"].max())
             return f"There is no book number {n}. Numbers go from 1 to {top}."
-        r = next(df.itertuples())
+        r = next(found.itertuples())
+        if r.upcoming:
+            return describe(r)
         return f"{describe(r)}\n\nSay `borrow {r.id}` to take it home."
 
     only = bool(re.search(r"\bavailable\b", t))
@@ -468,29 +656,41 @@ def page_auth():
 def page_dashboard(user):
     first = html.escape(user["name"].split()[0])
     page_header(f"Welcome back, {first} 👋", "Here's what's happening in the library today.")
-    books = read("SELECT * FROM books")
+    books = load_books()
+    released = books[~books["upcoming"]]
     mine = active_loans(user["id"])
     today = str(date.today())
 
     c = st.columns(4)
-    c[0].metric("Titles in library", f"{len(books):,}")
-    c[1].metric("Copies on shelf", f"{int(books['available'].sum()):,}")
+    c[0].metric("Titles in library", f"{len(released):,}")
+    c[1].metric("Copies on shelf", f"{int(released['available'].sum()):,}")
     c[2].metric("Your active loans", len(mine))
     c[3].metric("Your overdue", int((mine["due_on"] < today).sum()))
 
     if user["role"] == "admin":
         all_active = read("SELECT * FROM loans WHERE returned_on IS NULL")
-        a = st.columns(3)
+        a = st.columns(4)
         a[0].metric("Members", int(read("SELECT COUNT(*) AS n FROM users")["n"][0]))
         a[1].metric("Loans out now", len(all_active))
         a[2].metric("Overdue (all)", int((all_active["due_on"] < today).sum()))
+        a[3].metric("Coming soon", int(books["upcoming"].sum()))
 
     st.write("")
+    st.subheader("Discover")
+    tab_pop, tab_new, tab_soon = st.tabs(["🔥 Popular", "🆕 New arrivals", "🔜 Coming soon"])
+    with tab_pop:
+        show_strip(books[books["is_popular"]].sort_values("pop_score", ascending=False))
+    with tab_new:
+        show_strip(books[books["is_new"]].sort_values(["year", "id"], ascending=False))
+    with tab_soon:
+        show_strip(books[books["upcoming"]].sort_values("release_date"))
+    st.caption("Open the Catalog to see the full lists and filter by age group.")
+
     left, right = st.columns(2)
     with left:
         st.subheader("Top genres")
         st.bar_chart(
-            books.groupby("genre").size().sort_values(ascending=False).head(10),
+            released.groupby("genre").size().sort_values(ascending=False).head(10),
             horizontal=True,
         )
     with right:
@@ -516,7 +716,16 @@ def page_dashboard(user):
 
 def page_catalog(user):
     page_header("Catalog", "Browse, search and borrow from the collection.")
-    books = read("SELECT * FROM books")
+    books = load_books()
+
+    v1, v2 = st.columns(2)
+    view = v1.segmented_control(
+        "Browse", VIEWS, default="All", key="cat_view", label_visibility="collapsed"
+    ) or "All"
+    age_label = v2.segmented_control(
+        "Age", list(AGE_LABELS), default="All ages", key="cat_age", label_visibility="collapsed"
+    ) or "All ages"
+
     c1, c2, c3, c4 = st.columns([3, 2, 2, 1.4])
     query = c1.text_input(
         "Search", placeholder="🔍 Title, author, genre or book number", label_visibility="collapsed"
@@ -526,12 +735,23 @@ def page_catalog(user):
         label_visibility="collapsed",
     )
     sort = c3.selectbox(
-        "Sort", ["Title A–Z", "Author A–Z", "Newest first", "Oldest first", "Book number"],
+        "Sort",
+        ["Recommended", "Title A–Z", "Author A–Z", "Newest first", "Oldest first", "Book number"],
         label_visibility="collapsed",
     )
     only = c4.toggle("Available")
 
     df = books.copy()
+    if view == "🆕 New":
+        df = df[df["is_new"]]
+    elif view == "🔥 Popular":
+        df = df[df["is_popular"]]
+    elif view == "🔜 Upcoming":
+        df = df[df["upcoming"]]
+    age = AGE_LABELS[age_label]
+    if age:
+        df = df[df["age_group"] == age]
+
     q = query.strip().lower()
     if q:
         blob = (df["title"] + " " + df["author"] + " " + df["genre"].fillna("")).str.lower()
@@ -542,8 +762,18 @@ def page_catalog(user):
     if genre != "All genres":
         df = df[df["genre"] == genre]
     if only:
-        df = df[df["available"] > 0]
-    if sort == "Title A–Z":
+        df = df[(df["available"] > 0) & ~df["upcoming"]]
+
+    if sort == "Recommended":
+        if view == "🆕 New":
+            df = df.sort_values(["year", "id"], ascending=False)
+        elif view == "🔥 Popular":
+            df = df.sort_values("pop_score", ascending=False)
+        elif view == "🔜 Upcoming":
+            df = df.sort_values("release_date")
+        else:
+            df = df.sort_values("title")
+    elif sort == "Title A–Z":
         df = df.sort_values("title")
     elif sort == "Author A–Z":
         df = df.sort_values(["author", "title"])
@@ -554,7 +784,7 @@ def page_catalog(user):
     else:
         df = df.sort_values("id")
 
-    sig = (q, genre, sort, only)
+    sig = (q, genre, sort, only, view, age_label)
     if st.session_state.get("cat_sig") != sig:
         st.session_state.cat_sig = sig
         st.session_state.cat_page = 0
@@ -564,6 +794,8 @@ def page_catalog(user):
     chunk = df.iloc[start:start + PAGE_SIZE]
     shown_from = start + 1 if len(df) else 0
     st.caption(f"Showing {shown_from}–{start + len(chunk)} of {len(df)} books")
+    if df.empty:
+        st.info("No books match these filters. Try a different category or age group.")
 
     rows = list(chunk.itertuples())
     for i in range(0, len(rows), 3):
@@ -571,8 +803,14 @@ def page_catalog(user):
         for col, b in zip(cols, rows[i:i + 3]):
             with col:
                 st.markdown(book_card_html(b), unsafe_allow_html=True)
-                label = "Borrow" if b.available > 0 else "Unavailable"
-                if st.button(label, key=f"borrow_{b.id}", disabled=b.available < 1, width="stretch"):
+                if b.upcoming:
+                    label = "Coming soon"
+                elif b.available > 0:
+                    label = "Borrow"
+                else:
+                    label = "Unavailable"
+                disabled = bool(b.upcoming) or b.available < 1
+                if st.button(label, key=f"borrow_{b.id}", disabled=disabled, width="stretch"):
                     ok, msg = borrow_book(int(b.id), user["id"])
                     done(ok, msg)
         st.write("")
@@ -598,11 +836,20 @@ def page_bot(user):
     pending = None
     quick = [
         ("🎲 Surprise me", "surprise me"),
-        ("🔖 My loans", "my loans"),
-        ("🗂️ Genres", "genres"),
-        ("✅ Available now", "available"),
+        ("🔥 Popular", "popular"),
+        ("🆕 New arrivals", "new arrivals"),
+        ("🔜 Coming soon", "coming soon"),
     ]
     for col, (label, text) in zip(st.columns(4), quick):
+        if col.button(label, width="stretch"):
+            pending = text
+    quick2 = [
+        ("🧒 Kids", "books for kids"),
+        ("🧑 Teens", "books for teens"),
+        ("📖 Manga", "popular manga"),
+        ("🔖 My loans", "my loans"),
+    ]
+    for col, (label, text) in zip(st.columns(4), quick2):
         if col.button(label, width="stretch"):
             pending = text
 
@@ -670,22 +917,32 @@ def page_add_books(user):
             author = st.text_input("Author *")
             c1, c2, c3 = st.columns(3)
             genre = c1.text_input("Genre")
-            year = c2.number_input("Year", 0, date.today().year, 2000)
+            year = c2.number_input("Year", 0, date.today().year + 5, date.today().year)
             copies = c3.number_input("Copies", 1, 100, 1)
+            d1, d2 = st.columns(2)
+            age_label = d1.selectbox("Age group", list(AGE_LABELS)[1:], index=2)
+            release = d2.date_input(
+                "Release date (pick a future date for an upcoming book)", value=date.today()
+            )
             isbn = st.text_input("ISBN")
             if st.form_submit_button("Add book", type="primary"):
                 if not title.strip() or not author.strip():
                     st.error("Title and author are required.")
                 else:
+                    release_val = str(release) if release > date.today() else None
                     new_id = run(
-                        "INSERT INTO books (title, author, genre, year, isbn, copies, available) "
-                        "VALUES (?,?,?,?,?,?,?)",
+                        "INSERT INTO books (title, author, genre, year, isbn, copies, available, "
+                        "age_group, release_date, added_on) VALUES (?,?,?,?,?,?,?,?,?,?)",
                         (title.strip(), author.strip(), genre.strip() or "Other", int(year),
-                         isbn.strip(), int(copies), int(copies)),
+                         isbn.strip(), int(copies), int(copies), AGE_LABELS[age_label],
+                         release_val, str(date.today())),
                     )
                     st.success(f"Added “{title}” as book number {new_id}.")
     with tab_csv:
-        st.write("Upload a CSV with the columns `title`, `author`, and optionally `genre`, `year`, `copies`.")
+        st.write(
+            "Upload a CSV with the columns `title`, `author`, and optionally `genre`, `year`, "
+            "`copies`, `age` (Kids, Teens or Adults) and `release_date` (YYYY-MM-DD)."
+        )
         st.download_button("Download template", TEMPLATE, "books_template.csv", "text/csv")
         file = st.file_uploader("CSV file", type="csv")
         if file and st.button("Import books", type="primary"):
@@ -697,8 +954,10 @@ def page_add_books(user):
 
 
 def page_manage(user):
-    page_header("Manage", "Members, all loans and catalog clean-up.")
-    tab_members, tab_loans, tab_books = st.tabs(["Members", "All loans", "Remove books"])
+    page_header("Manage", "Members, loans, release dates and catalog clean-up.")
+    tab_members, tab_loans, tab_soon, tab_books = st.tabs(
+        ["Members", "All loans", "Upcoming releases", "Remove books"]
+    )
 
     with tab_members:
         users = read("SELECT id, username, full_name, email, role, joined FROM users ORDER BY id")
@@ -728,6 +987,33 @@ def page_manage(user):
                 for r in loans.itertuples()
             ]
             st.dataframe(loans, width="stretch", hide_index=True)
+
+    with tab_soon:
+        books = load_books()
+        soon = books[books["upcoming"]].sort_values("release_date")
+        if soon.empty:
+            st.info("No upcoming releases right now.")
+        else:
+            st.dataframe(
+                soon[["id", "title", "author", "genre", "age_group", "release_date"]],
+                width="stretch", hide_index=True,
+            )
+            labels = {f"{r.title} — out {r.release_date} (#{r.id})": int(r.id) for r in soon.itertuples()}
+            pick = st.selectbox("Upcoming book", list(labels))
+            new_date = st.date_input("New release date", value=date.today() + timedelta(days=30))
+            b1, b2 = st.columns(2)
+            if b1.button("Update release date", width="stretch"):
+                if new_date <= date.today():
+                    st.error("Pick a future date, or use “Release it now”.")
+                else:
+                    run("UPDATE books SET release_date=? WHERE id=?", (str(new_date), labels[pick]))
+                    done(True, "Release date updated.")
+            if b2.button("Release it now", type="primary", width="stretch"):
+                run(
+                    "UPDATE books SET release_date=NULL, added_on=? WHERE id=?",
+                    (str(date.today()), labels[pick]),
+                )
+                done(True, "The book is now available to borrow.")
 
     with tab_books:
         books = read("SELECT id, title, author FROM books ORDER BY title")
