@@ -11,7 +11,6 @@ from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 
-from books_data import BOOKS
 
 DB_FILE = "library_v2.db"
 MAX_LOANS = 5
